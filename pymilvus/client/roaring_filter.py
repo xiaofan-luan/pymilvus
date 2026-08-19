@@ -140,42 +140,54 @@ class _Layout(NamedTuple):
     body_length: int
 
 
-def _count_high_containers(keys: np.ndarray) -> int:
-    """Count distinct high-32 buckets in bounded memory.
+def _bucket_counts(keys: np.ndarray) -> Tuple[int, int]:
+    """Count distinct high-32 and low-16 buckets in bounded memory.
 
     Chunked rather than vectorised over the whole array on purpose: the point of this function is
     to spend almost nothing, so its own temporaries have to stay small no matter how many members
     the caller passed.
     """
     if keys.size == 0:
-        return 0
-    count = 1
+        return 0, 0
+    high_count = 1
+    low_count = 1
     for start in range(1, keys.size, _CHUNK):
         stop = min(start + _CHUNK, keys.size)
         current = keys[start:stop]
         previous = keys[start - 1 : stop - 1]
-        count += int(np.count_nonzero((current >> _SHIFT32) != (previous >> _SHIFT32)))
-    return count
+        high_count += int(np.count_nonzero((current >> _SHIFT32) != (previous >> _SHIFT32)))
+        low_count += int(np.count_nonzero((current >> _SHIFT16) != (previous >> _SHIFT16)))
+    return high_count, low_count
 
 
-def _check_high_container_limit(high_count: int) -> None:
+def _check_bucket_limits(high_count: int, low_count: int) -> None:
     """Refuse a hopeless key set before ``_plan`` allocates anything proportional to it.
 
     ``_plan`` builds a dozen arrays sized by the member or container count, which for a sparse set
     -- shuffled full-range int64 ids land in nearly one high container each -- costs hundreds of
     megabytes only to conclude the server would reject it anyway. Five million random int64
-    members measured at ~700 MB of transient allocation before this gate existed, and that shape
-    is precisely the one this limit describes.
+    members measured at ~700 MB of transient allocation before this gate existed.
 
-    Only the high-container count is gated here, and only because a counting pass computes it
-    exactly. The decoded-size limit stays inside ``_plan``: its estimate includes the body length,
-    which is not known until the layout exists, so gating on it early would mean comparing a lower
-    bound and then reporting that bound as the size. A caller sizing a membership set needs the
-    real number.
+    Both limits are decidable from the counts. The high-container count is compared exactly. The
+    decoded-size estimate is not yet exact -- it also includes the body length, which does not
+    exist until the layout does -- but the per-container overhead alone is a *lower bound*, so a
+    set whose overhead already exceeds the cap can never fit however small its body turns out to
+    be. Rejecting on that lower bound is therefore sound, and the message says "at least" rather
+    than quoting the bound as the size: a caller has to know what to shrink, and understating the
+    figure would misinform them. Borderline sets, where the body is what tips the estimate over,
+    still fall through to the exact check in ``_plan``.
     """
     if high_count > _MAX_HIGH_CONTAINERS:
         raise ParamError(
             message=f"high-container count {high_count} exceeds maximum {_MAX_HIGH_CONTAINERS}"
+        )
+    overhead = high_count * _HIGH_CONTAINER_OVERHEAD + low_count * _LOW_CONTAINER_OVERHEAD
+    if overhead > _MAX_DECODED_BYTES:
+        raise ParamError(
+            message=(
+                f"estimated decoded size is at least {overhead}, "
+                f"exceeding maximum {_MAX_DECODED_BYTES}"
+            )
         )
 
 
@@ -325,7 +337,7 @@ def _serialize(keys: np.ndarray) -> bytes:
             _HEADER_FORMAT, _MAGIC, _VERSION, _FORMAT_PORTABLE_ROARING64, 0, 8, 0
         ) + (b"\x00" * 8)
 
-    _check_high_container_limit(_count_high_containers(keys))
+    _check_bucket_limits(*_bucket_counts(keys))
     layout = _plan(keys)
     blob = bytearray(_HEADER_SIZE + layout.body_length)
     view = memoryview(blob)
@@ -462,24 +474,35 @@ class RoaringBitmapBuilder:
             self._lock.release()
 
     def _compact(self) -> None:
-        """Merges the pending batches into the sorted distinct key set."""
+        """Merges the pending batches into the sorted distinct key set.
+
+        All or nothing. Every allocation that can fail happens before any state is replaced, so
+        an exception -- a MemoryError out of one of these merges is the realistic one, since they
+        are the largest allocations the builder makes -- leaves the pending batches exactly where
+        they were and a retry still sees every member. Clearing ``_parts`` up front instead would
+        drop the only reference to them, and because ``build()`` and ``cardinality`` do not poison
+        the builder, the retry would quietly return a bitmap missing whatever was pending: a
+        false negative in a predicate whose entire purpose is exactness.
+        """
         if not self._parts:
             return
         fresh = np.unique(np.concatenate(self._parts))
+        if self._keys.size == 0:
+            merged_keys = fresh
+        else:
+            merged = np.concatenate([self._keys, fresh])
+            # Both halves arrive sorted, so a stable sort is timsort merging two existing runs in
+            # linear time rather than sorting from scratch -- 3x faster than np.unique over the
+            # concatenation, and the result is identical either way.
+            merged.sort(kind="stable")
+            keep = np.empty(merged.size, dtype=bool)
+            keep[0] = True
+            np.not_equal(merged[1:], merged[:-1], out=keep[1:])
+            merged_keys = merged[keep]
+
+        self._keys = merged_keys
         self._parts = []
         self._pending = 0
-        if self._keys.size == 0:
-            self._keys = fresh
-            return
-        merged = np.concatenate([self._keys, fresh])
-        # Both halves arrive sorted, so a stable sort is timsort merging two existing runs in
-        # linear time rather than sorting from scratch -- 3x faster than np.unique over the
-        # concatenation, and the result is identical either way.
-        merged.sort(kind="stable")
-        keep = np.empty(merged.size, dtype=bool)
-        keep[0] = True
-        np.not_equal(merged[1:], merged[:-1], out=keep[1:])
-        self._keys = merged[keep]
 
     @property
     def cardinality(self) -> int:

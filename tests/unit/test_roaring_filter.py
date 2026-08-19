@@ -1,4 +1,5 @@
 import base64
+import contextlib
 import hashlib
 import inspect
 import json
@@ -8,13 +9,14 @@ import struct
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
+from unittest.mock import patch
 
 import numpy as np
 import pytest
-from pymilvus import RoaringBitmapBuilder, build_roaring_bitmap
+from pymilvus import MilvusClient, RoaringBitmapBuilder, build_roaring_bitmap
 from pymilvus.client import roaring_filter
 from pymilvus.client.prepare import Prepare
-from pymilvus.exceptions import ParamError
+from pymilvus.exceptions import MilvusException, ParamError
 
 MASK64 = (1 << 64) - 1
 
@@ -410,12 +412,26 @@ def test_rejects_too_many_high_containers():
         build_roaring_bitmap([*members, ceiling << 32])
 
 
-def test_rejects_oversized_estimated_decoded_size():
-    """The decoded-size estimate counts per-container overhead, not just the body."""
+def test_rejects_oversized_estimated_decoded_size(monkeypatch):
+    """The decoded-size estimate counts per-container overhead, not just the body.
+
+    200K high containers of four low containers each is 76.8 MiB of fixed overhead before a
+    single body byte, so it cannot fit however the bodies encode. That verdict is decidable from
+    the bucket counts, so it is reached without ``_plan`` laying out 800K containers first, and
+    the message says "at least" -- quoting the overhead as if it were the size would understate
+    what the caller has to shrink.
+    """
+    planned = []
+    monkeypatch.setattr(
+        roaring_filter, "_plan", lambda *args: planned.append(1) or pytest.fail("planned")
+    )
     members = [high << 32 | low << 16 for high in range(200_000) for low in range(4)]
 
-    with pytest.raises(ParamError, match=r"estimated decoded size \d+ exceeds maximum 67108864"):
+    with pytest.raises(
+        ParamError, match=r"estimated decoded size is at least 76800000, exceeding maximum 67108864"
+    ):
         build_roaring_bitmap(members)
+    assert planned == []
 
 
 def test_limits_are_checked_before_the_body_is_allocated(monkeypatch):
@@ -451,25 +467,6 @@ def test_a_hopelessly_sparse_set_is_refused_without_planning_it(monkeypatch):
     assert planned == []
 
 
-def test_the_early_gate_defers_the_decoded_size_limit_to_the_planner(monkeypatch):
-    """A set that only blows the decoded-size limit must still be planned, for the real number.
-
-    The early gate deliberately checks nothing but the high-container count. The decoded-size
-    estimate depends on the body length, which does not exist until the layout does, so gating on
-    it early would report a lower bound as the size and understate what the caller has to shrink.
-    """
-    planned = []
-    real_plan = roaring_filter._plan
-    monkeypatch.setattr(
-        roaring_filter, "_plan", lambda *args: planned.append(1) or real_plan(*args)
-    )
-
-    members = [high << 32 | low << 16 for high in range(200_000) for low in range(4)]
-    with pytest.raises(ParamError, match=r"estimated decoded size \d+ exceeds maximum 67108864"):
-        build_roaring_bitmap(members)
-    assert planned == [1]
-
-
 def test_rejects_oversized_body(monkeypatch):
     """The 128 MiB body cap is reproduced from the reference even though the decoded-size cap
     bites first for every reachable input -- both are checked, in the reference's order."""
@@ -479,11 +476,24 @@ def test_rejects_oversized_body(monkeypatch):
         build_roaring_bitmap([1])
 
 
-def test_estimated_size_limit_is_checked_after_the_body_limit(monkeypatch):
-    monkeypatch.setattr(roaring_filter, "_MAX_DECODED_BYTES", 8)
+def test_a_borderline_estimate_is_decided_by_the_planner_with_the_exact_figure(monkeypatch):
+    """When only the body tips the estimate over, the planner decides and quotes the real size.
 
-    with pytest.raises(ParamError, match="estimated decoded size 222 exceeds maximum 8"):
+    One member costs 192 bytes of container overhead and 30 of body, so a 200-byte cap is above
+    what the bucket counts can rule out but below the true 222. The early gate must let this
+    through rather than refuse it on the overhead alone, and the error the caller sees must be
+    the exact figure -- that is the number they have to size against.
+    """
+    monkeypatch.setattr(roaring_filter, "_MAX_DECODED_BYTES", 200)
+    planned = []
+    real_plan = roaring_filter._plan
+    monkeypatch.setattr(
+        roaring_filter, "_plan", lambda *args: planned.append(1) or real_plan(*args)
+    )
+
+    with pytest.raises(ParamError, match="estimated decoded size 222 exceeds maximum 200"):
         build_roaring_bitmap([1])
+    assert planned == [1]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -659,6 +669,42 @@ def test_builder_compaction_is_not_lossy(monkeypatch):
     assert builder.build() == build_roaring_bitmap(members)
 
 
+def test_a_failed_compaction_keeps_the_pending_members(monkeypatch):
+    """A merge that runs out of memory must not swallow the members it was merging.
+
+    Compaction merges the pending batches into the accumulated key set. Those merges are the
+    largest allocations the builder makes, so MemoryError is where they realistically fail, and
+    neither build() nor cardinality poisons the builder afterwards. If the pending batches were
+    released before the merge completed, the retry would succeed and quietly return a bitmap
+    short of whatever was pending -- a false negative in a predicate whose whole point is being
+    exact, and one that reports no error at all.
+    """
+    builder = RoaringBitmapBuilder()
+    builder.add_int64_batch([1])
+    builder.build()  # compacts, so {1} is in the accumulated set and nothing is pending
+    builder.add_int64_batch([2])
+
+    real_concatenate = np.concatenate
+    calls = []
+
+    def failing_concatenate(arrays, *args, **kwargs):
+        calls.append(1)
+        # The first call gathers the pending batches; the second merges them into _keys. Fail
+        # the merge, which is the one holding the only reference to the pending members.
+        if len(calls) == 2:
+            raise MemoryError("injected")
+        return real_concatenate(arrays, *args, **kwargs)
+
+    monkeypatch.setattr(np, "concatenate", failing_concatenate)
+    with pytest.raises(MemoryError):
+        builder.build()
+    monkeypatch.undo()
+
+    assert calls == [1, 1], "the test has to fail the merge, not the gather"
+    assert builder.cardinality == 2
+    assert builder.build() == build_roaring_bitmap([1, 2])
+
+
 def test_builder_cardinality_counts_distinct_members():
     builder = RoaringBitmapBuilder()
     assert builder.cardinality == 0
@@ -752,6 +798,51 @@ def test_build_roaring_bitmap_and_template_bytes_value():
 
     assert values["rb"].bytes_val == blob
     assert values["rb"].WhichOneof("val") == "bytes_val"
+
+
+def test_roaring_blob_reaches_the_wire_through_the_public_client(mock_grpc_handler, mock_grpc_stub):
+    """The blob survives the real client route, not just protobuf preparation.
+
+    The request-building tests below call ``Prepare`` directly, which proves the protobuf is
+    assembled correctly but steps over everything MilvusClient does on the way there. This drives
+    the public query/search/delete APIs with only the gRPC stub mocked, so the whole client path
+    runs, and asserts on the request that actually left for the wire.
+
+    The mocked stub answers with an empty response, which the client rightly rejects while
+    parsing; that happens after the request is sent, and the request is what is under test here.
+    """
+    blob = build_roaring_bitmap([1, -1, 1 << 40])
+    expr = "roaring_match(id, {rb})"
+
+    with patch("pymilvus.orm.connections.GrpcHandler", return_value=mock_grpc_handler), patch(
+        "pymilvus.client.grpc_handler.GrpcHandler", return_value=mock_grpc_handler
+    ):
+        client = MilvusClient()
+        with contextlib.suppress(MilvusException):
+            client.query("coll", filter=expr, filter_params={"rb": blob})
+        with contextlib.suppress(MilvusException):
+            client.search(
+                "coll",
+                data=[[1.0, 2.0]],
+                anns_field="vector",
+                filter=expr,
+                filter_params={"rb": blob},
+                search_params={"metric_type": "L2"},
+            )
+        with contextlib.suppress(MilvusException):
+            client.delete("coll", filter=expr, filter_params={"rb": blob})
+
+    sent = {
+        "query": mock_grpc_stub.Query.call_args,
+        "search": mock_grpc_stub.Search.call_args,
+        "delete": mock_grpc_stub.Delete.future.call_args,
+    }
+    for route, call in sent.items():
+        assert call is not None, f"the client never sent a {route} request"
+        request = call[0][0]
+        value = request.expr_template_values["rb"]
+        assert value.WhichOneof("val") == "bytes_val", route
+        assert value.bytes_val == blob, route
 
 
 def test_roaring_blob_reaches_query_search_and_delete_requests():
