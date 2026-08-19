@@ -433,6 +433,43 @@ def test_limits_are_checked_before_the_body_is_allocated(monkeypatch):
     assert allocated == []
 
 
+def test_a_hopelessly_sparse_set_is_refused_without_planning_it(monkeypatch):
+    """The layout is never built for a set the high-container limit already rules out.
+
+    ``_plan`` allocates a dozen arrays sized by the member and container counts, so a sparse set
+    -- shuffled full-range int64 ids land in nearly one high container each -- used to cost
+    hundreds of megabytes of numpy temporaries only to be refused at the end of it. Asserting
+    ``_plan`` is not entered is the honest form of that claim; measuring RSS would be flaky.
+    """
+    planned = []
+    monkeypatch.setattr(
+        roaring_filter, "_plan", lambda *args: planned.append(1) or pytest.fail("planned")
+    )
+
+    with pytest.raises(ParamError, match="high-container count 262145 exceeds maximum 262144"):
+        build_roaring_bitmap([value << 32 for value in range((1 << 18) + 1)])
+    assert planned == []
+
+
+def test_the_early_gate_defers_the_decoded_size_limit_to_the_planner(monkeypatch):
+    """A set that only blows the decoded-size limit must still be planned, for the real number.
+
+    The early gate deliberately checks nothing but the high-container count. The decoded-size
+    estimate depends on the body length, which does not exist until the layout does, so gating on
+    it early would report a lower bound as the size and understate what the caller has to shrink.
+    """
+    planned = []
+    real_plan = roaring_filter._plan
+    monkeypatch.setattr(
+        roaring_filter, "_plan", lambda *args: planned.append(1) or real_plan(*args)
+    )
+
+    members = [high << 32 | low << 16 for high in range(200_000) for low in range(4)]
+    with pytest.raises(ParamError, match=r"estimated decoded size \d+ exceeds maximum 67108864"):
+        build_roaring_bitmap(members)
+    assert planned == [1]
+
+
 def test_rejects_oversized_body(monkeypatch):
     """The 128 MiB body cap is reproduced from the reference even though the decoded-size cap
     bites first for every reachable input -- both are checked, in the reference's order."""

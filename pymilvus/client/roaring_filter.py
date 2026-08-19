@@ -49,6 +49,7 @@ _U16_LE = np.dtype("<u2")
 _U32_LE = np.dtype("<u4")
 
 _SHIFT16 = np.uint64(16)
+_SHIFT32 = np.uint64(32)
 _ONE64 = np.uint64(1)
 _LOW16_MASK = np.uint64(0xFFFF)
 
@@ -137,6 +138,45 @@ class _Layout(NamedTuple):
     cookie_size: np.ndarray
     run_bitmap_size: np.ndarray
     body_length: int
+
+
+def _count_high_containers(keys: np.ndarray) -> int:
+    """Count distinct high-32 buckets in bounded memory.
+
+    Chunked rather than vectorised over the whole array on purpose: the point of this function is
+    to spend almost nothing, so its own temporaries have to stay small no matter how many members
+    the caller passed.
+    """
+    if keys.size == 0:
+        return 0
+    count = 1
+    for start in range(1, keys.size, _CHUNK):
+        stop = min(start + _CHUNK, keys.size)
+        current = keys[start:stop]
+        previous = keys[start - 1 : stop - 1]
+        count += int(np.count_nonzero((current >> _SHIFT32) != (previous >> _SHIFT32)))
+    return count
+
+
+def _check_high_container_limit(high_count: int) -> None:
+    """Refuse a hopeless key set before ``_plan`` allocates anything proportional to it.
+
+    ``_plan`` builds a dozen arrays sized by the member or container count, which for a sparse set
+    -- shuffled full-range int64 ids land in nearly one high container each -- costs hundreds of
+    megabytes only to conclude the server would reject it anyway. Five million random int64
+    members measured at ~700 MB of transient allocation before this gate existed, and that shape
+    is precisely the one this limit describes.
+
+    Only the high-container count is gated here, and only because a counting pass computes it
+    exactly. The decoded-size limit stays inside ``_plan``: its estimate includes the body length,
+    which is not known until the layout exists, so gating on it early would mean comparing a lower
+    bound and then reporting that bound as the size. A caller sizing a membership set needs the
+    real number.
+    """
+    if high_count > _MAX_HIGH_CONTAINERS:
+        raise ParamError(
+            message=f"high-container count {high_count} exceeds maximum {_MAX_HIGH_CONTAINERS}"
+        )
 
 
 def _plan(keys: np.ndarray) -> _Layout:
@@ -285,6 +325,7 @@ def _serialize(keys: np.ndarray) -> bytes:
             _HEADER_FORMAT, _MAGIC, _VERSION, _FORMAT_PORTABLE_ROARING64, 0, 8, 0
         ) + (b"\x00" * 8)
 
+    _check_high_container_limit(_count_high_containers(keys))
     layout = _plan(keys)
     blob = bytearray(_HEADER_SIZE + layout.body_length)
     view = memoryview(blob)
